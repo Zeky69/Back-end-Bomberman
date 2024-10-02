@@ -1,104 +1,104 @@
-# services/game_service.py
+# app/services/game_service.py
+
+from typing import Dict, List
+from app.repositories.redis_repository import RedisRepository
+from app.models.game_models import GameState, Bomb
 import asyncio
-from app.models.models import Game, Bomb, Explosion, Player
-from typing import Dict
-import math
-import time
 
-MOVEMENT_SPEED = 2.0  # Vitesse de déplacement en cases par seconde
+class GameService:
+    def __init__(self, redis_repo: RedisRepository):
+        self.redis = redis_repo
 
-async def game_loop(game: Game):
-    while game.is_active:
-        start_time = time.time()
-        update_players(game)
-        await broadcast_game_state(game)
-        elapsed = time.time() - start_time
-        await asyncio.sleep(max(0, 1/60 - elapsed))  # 60 mises à jour par seconde
+    async def start_game(self, room_id: str, players: List[str]):
+        await self.redis.set_game_started(room_id)
+        initial_state = {
+            "players": {player: {"position": [0, 0], "bombs": 0} for player in players},
+            "map": self.generate_initial_map(),
+            "bombs": [],
+            "explosions": []
+        }
+        await self.redis.set_game_state(room_id, initial_state)
+        return initial_state
 
-def update_players(game: Game):
-    for player_id, player in game.state.players.items():
-        if player.moving_direction:
-            dx, dy = direction_to_delta(player.moving_direction)
-            new_x = player.x + dx * MOVEMENT_SPEED / 60
-            new_y = player.y + dy * MOVEMENT_SPEED / 60
+    def generate_initial_map(self):
+        # Implémentez la logique pour générer une carte de jeu initiale
+        return {
+            "width": 15,
+            "height": 15,
+            "walls": self.generate_walls(),
+            "bombs": [],
+            "explosions": []
+        }
 
-            # Vérifier les collisions
-            if not is_collision(game, new_x, new_y):
-                player.x = new_x
-                player.y = new_y
-            else:
-                player.moving_direction = None  # Arrêter le déplacement en cas de collision
+    def generate_walls(self):
+        # Exemple simplifié : créer des murs aux positions paires
+        walls = []
+        for x in range(15):
+            for y in range(15):
+                if x % 2 == 0 and y % 2 == 0:
+                    walls.append([x, y])
+        return walls
 
-def direction_to_delta(direction: str) -> tuple:
-    deltas = {
-        "up": (0, -1),
-        "down": (0, 1),
-        "left": (-1, 0),
-        "right": (1, 0),
-    }
-    return deltas.get(direction, (0, 0))
+    async def handle_game_action(self, room_id: str, username: str, action: dict):
+        if not await self.redis.is_game_started(room_id):
+            raise ValueError("Le jeu n'a pas encore commencé")
 
-def is_collision(game: Game, x: float, y: float) -> bool:
-    tile_x = int(math.floor(x))
-    tile_y = int(math.floor(y))
-    if game.state.get_tile(tile_x, tile_y) == 1:  # 1 représente un mur destructible
-        return True
-    # Ajouter d'autres vérifications de collision si nécessaire (autres joueurs, bombes, etc.)
-    return False
+        game_state = await self.redis.get_game_state(room_id)
+        updated_state = self.process_action(game_state, username, action)
+        await self.redis.set_game_state(room_id, updated_state)
+        return updated_state
 
-async def broadcast_game_state(game: Game):
-    for connection in game.connections:
-        await connection.send_json(game.state.dict())
+    def process_action(self, game_state: dict, username: str, action: dict) -> dict:
+        player = game_state["players"].get(username)
+        if not player:
+            return game_state
 
+        if action["type"] == "move":
+            direction = action.get("direction")
+            if direction:
+                if direction == "up":
+                    player["position"][1] -= 1
+                elif direction == "down":
+                    player["position"][1] += 1
+                elif direction == "left":
+                    player["position"][0] -= 1
+                elif direction == "right":
+                    player["position"][0] += 1
 
+        elif action["type"] == "place_bomb":
+            if player["bombs"] < 1:  # Limiter le nombre de bombes par joueur
+                bomb = Bomb(position=player["position"].copy(), owner=username, timer=3)
+                game_state["bombs"].append(bomb.dict())
+                player["bombs"] += 1
 
-async def handle_bomb(game: Game, bomb: Bomb):
-    await asyncio.sleep(bomb.timer)  # Attendre que la bombe explose
-    explode_bomb(game, bomb)
+        # Ajoutez d'autres types d'actions selon les besoins
 
-def explode_bomb(game: Game, bomb: Bomb):
-    explosion_range = 2
-    x, y = bomb.x, bomb.y
-    directions = ['up', 'down', 'left', 'right']
+        return game_state
 
-    for direction in directions:
-        for distance in range(1, explosion_range + 1):
-            if direction == 'up':
-                nx, ny = x, y - distance
-            elif direction == 'down':
-                nx, ny = x, y + distance
-            elif direction == 'left':
-                nx, ny = x - distance, y
-            elif direction == 'right':
-                nx, ny = x + distance, y
+    async def game_loop(self, room_id: str):
+        while await self.redis.is_game_started(room_id):
+            game_state = await self.redis.get_game_state(room_id)
+            # Logique pour gérer les bombes et les explosions
+            updated_bombs = []
+            for bomb in game_state["bombs"]:
+                bomb["timer"] -= 1
+                if bomb["timer"] <= 0:
+                    # Gérer l'explosion
+                    # Mettre à jour les positions des joueurs, les murs, etc.
+                    self.handle_explosion(game_state, bomb)
+                else:
+                    updated_bombs.append(bomb)
+            game_state["bombs"] = updated_bombs
+            await self.redis.set_game_state(room_id, game_state)
+            await asyncio.sleep(1)  # Intervalle de mise à jour (1 seconde)
 
-            if 0 <= nx < len(game.state.grid) and 0 <= ny < len(game.state.grid[0]):
-                if game.state.get_tile(nx, ny) == 1:
-                    game.state.set_tile(nx, ny, 0)  # Détruire le mur
-                    break  # L'explosion s'arrête ici
-                elif game.state.get_tile(nx, ny) == 0:
-                    explosion = Explosion(x=nx, y=ny, direction=direction)
-                    game.add_explosion(explosion)
-                    asyncio.create_task(handle_explosion(game, explosion))
-            else:
-                break  # Hors limites
-
-    game.remove_bomb(bomb)
-    asyncio.create_task(broadcast_game_state(game))
-
-async def handle_explosion(game: Game, explosion: Explosion):
-    await asyncio.sleep(explosion.duration)  # Durée de l'explosion
-    game.remove_explosion(explosion)
-    await broadcast_game_state(game)
-
-def place_bomb(game: Game, player_id: str, x: float, y: float):
-    tile_x = int(math.floor(x))
-    tile_y = int(math.floor(y))
-    for bomb in game.state.bombs:
-        if bomb.x == tile_x and bomb.y == tile_y:
-            return  # Ne pas placer de bombe supplémentaire
-
-    bomb = Bomb(x=tile_x, y=tile_y, owner_id=player_id)
-    game.add_bomb(bomb)
-    game.state.set_tile(tile_x, tile_y, 2)  # 2 représente une bombe
-    asyncio.create_task(handle_bomb(game, bomb))
+    def handle_explosion(self, game_state: dict, bomb: dict):
+        # Implémentez la logique des explosions
+        # Par exemple, éliminer les joueurs proches, détruire les murs, etc.
+        explosion_position = bomb["position"]
+        # Exemple simplifié : ajouter l'explosion à l'état du jeu
+        game_state["explosions"].append({"position": explosion_position})
+        # Réinitialiser le nombre de bombes pour le joueur
+        owner = bomb["owner"]
+        if owner in game_state["players"]:
+            game_state["players"][owner]["bombs"] -= 1

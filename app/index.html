@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Bomberman Game</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+        }
+        #login, #create-room, #join-room, #game {
+            margin: 20px;
+            padding: 20px;
+            border: 1px solid #ccc;
+            display: inline-block;
+            vertical-align: top;
+            width: 45%;
+            background-color: #f9f9f9;
+        }
+        #gameCanvas {
+            border: 1px solid #000;
+            background-color: #f0f0f0;
+        }
+        #controls {
+            margin: 20px;
+        }
+        #messages {
+            margin-top: 20px;
+            height: 150px;
+            overflow-y: scroll;
+            border: 1px solid #ccc;
+            padding: 10px;
+            text-align: left;
+            width: 80%;
+            margin-left: auto;
+            margin-right: auto;
+            background-color: #fff;
+        }
+        .hidden {
+            display: none;
+        }
+        .room-item {
+            cursor: pointer;
+            padding: 5px;
+            border-bottom: 1px solid #ddd;
+        }
+        .room-item:hover {
+            background-color: #eee;
+        }
+    </style>
+</head>
+<body>
+    <h1>Bomberman Game</h1>
+
+    <div id="create-room">
+        <h2>Créer une Salle</h2>
+        <input id="create_username" placeholder="Nom d'utilisateur" />
+        <input id="create_room_id" placeholder="ID de la salle" />
+        <button onclick="createRoom()">Créer la Salle</button>
+    </div>
+
+    <div id="join-room">
+        <h2>Rejoindre une Salle</h2>
+        <input id="join_username" placeholder="Nom d'utilisateur" />
+        <button onclick="fetchRooms()">Actualiser la Liste des Salles</button>
+        <div id="room-list" style="text-align: left; margin: 10px auto; width: 90%; max-height: 200px; overflow-y: scroll; border: 1px solid #ccc; padding: 10px; background-color: #fff;">
+            <!-- Les salles disponibles seront listées ici -->
+        </div>
+    </div>
+
+    <div id="game" class="hidden">
+        <h2>Jeu</h2>
+        <canvas id="gameCanvas" width="600" height="600"></canvas>
+
+        <div id="controls">
+            <button onclick="sendMove('up')">Haut</button>
+            <button onclick="sendMove('down')">Bas</button>
+            <button onclick="sendMove('left')">Gauche</button>
+            <button onclick="sendMove('right')">Droite</button>
+            <button onclick="placeBomb()">Placer une Bombe</button>
+            <button id="start-game-btn" onclick="startGame()">Lancer la Partie</button>
+        </div>
+    </div>
+
+    <div id="messages"></div>
+    <button onclick="resetRedis()">Réinitialiser Redis</button>
+
+    <script>
+        let socket;
+        let username;
+        let room_id;
+        let gameState = null;
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const tileSize = 40;  // Taille d'une tuile en pixels
+
+        // Fonction pour afficher les messages
+        function log(message) {
+            const messages = document.getElementById("messages");
+            const messageElement = document.createElement("div");
+            messageElement.innerText = message;
+            messages.appendChild(messageElement);
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        // Fonction pour créer une salle
+        async function createRoom() {
+            const createUsername = document.getElementById("create_username").value.trim();
+            const createRoomId = document.getElementById("create_room_id").value.trim();
+
+            if (!createUsername || !createRoomId) {
+                alert("Veuillez entrer un nom d'utilisateur et un ID de salle.");
+                return;
+            }
+
+            try {
+                const response = await fetch("/create_room", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        room_id: createRoomId,
+                        username: createUsername
+                    })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    log(`Salle "${data.room_id}" créée par ${createUsername}.`);
+                    connectWebSocket(createRoomId, createUsername);
+                } else {
+                    log(`Erreur: ${data.error}`);
+                }
+            } catch (error) {
+                console.error("Erreur lors de la création de la salle:", error);
+                log("Erreur lors de la création de la salle.");
+            }
+        }
+
+        // Fonction pour récupérer et afficher la liste des salles
+        async function fetchRooms() {
+            try {
+                const response = await fetch("/list_rooms");
+                const rooms = await response.json();
+
+                const roomListDiv = document.getElementById("room-list");
+                roomListDiv.innerHTML = "";
+
+                if (rooms.length === 0) {
+                    roomListDiv.innerHTML = "<p>Aucune salle disponible.</p>";
+                    return;
+                }
+
+                rooms.forEach(room => {
+                    if (!room.game_started) { // Afficher seulement les salles non commencées
+                        const roomItem = document.createElement("div");
+                        roomItem.className = "room-item";
+                        roomItem.innerText = `ID: ${room.room_id} | Créateur: ${room.creator} | Joueurs: ${room.players.length}/4`;
+                        roomItem.onclick = () => joinRoom(room.room_id, room.creator);
+                        roomListDiv.appendChild(roomItem);
+                    }
+                });
+            } catch (error) {
+                console.error("Erreur lors de la récupération des salles:", error);
+                log("Erreur lors de la récupération des salles.");
+            }
+        }
+
+        // Fonction pour rejoindre une salle
+        async function joinRoom(selectedRoomId, creator) {
+            const joinUsername = document.getElementById("join_username").value.trim();
+
+            if (!joinUsername) {
+                alert("Veuillez entrer un nom d'utilisateur.");
+                return;
+            }
+
+            try {
+                // Vérifier si la salle existe et n'a pas commencé
+                const response = await fetch("/list_rooms");
+                const rooms = await response.json();
+                const room = rooms.find(r => r.room_id === selectedRoomId);
+
+                if (!room) {
+                    log(`Salle "${selectedRoomId}" n'existe pas.`);
+                    return;
+                }
+
+                if (room.game_started) {
+                    log(`La salle "${selectedRoomId}" a déjà commencé.`);
+                    return;
+                }
+
+                if (room.players.length >= 4) {
+                    log(`La salle "${selectedRoomId}" est pleine.`);
+                    return;
+                }
+
+                connectWebSocket(selectedRoomId, joinUsername);
+            } catch (error) {
+                console.error("Erreur lors de la jonction à la salle:", error);
+                log("Erreur lors de la jonction à la salle.");
+            }
+        }
+
+        // Fonction pour se connecter via WebSocket
+        function connectWebSocket(roomId, user) {
+            username = user;
+            room_id = roomId;
+
+            socket = new WebSocket(`ws://${window.location.hostname}:8000/ws/${room_id}/${username}`);
+
+            socket.onopen = () => {
+                log("Connecté au serveur WebSocket.");
+                document.getElementById("create-room").classList.add("hidden");
+                document.getElementById("join-room").classList.add("hidden");
+                document.getElementById("game").classList.remove("hidden");
+                document.getElementById("start-game-btn").classList.remove("hidden");
+            };
+
+            socket.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleMessage(data);
+            };
+
+            socket.onclose = () => {
+                log("Déconnecté du serveur WebSocket.");
+                document.getElementById("create-room").classList.remove("hidden");
+                document.getElementById("join-room").classList.remove("hidden");
+                document.getElementById("game").classList.add("hidden");
+            };
+
+            socket.onerror = (error) => {
+                console.error("Erreur WebSocket:", error);
+                alert("Erreur de connexion au serveur WebSocket.");
+            };
+        }
+
+        // Fonction pour gérer les messages reçus via WebSocket
+        function handleMessage(data) {
+            if (data.error) {
+                log(`Erreur: ${data.error}`);
+                return;
+            }
+
+            switch(data.event) {
+                case "player_joined":
+                    log(`${data.username} a rejoint la salle.`);
+                    break;
+                case "player_left":
+                    log(`${data.username} a quitté la salle.`);
+                    break;
+                case "game_started":
+                    log("Le jeu a commencé !");
+                    break;
+                case "game_state":
+                    gameState = data.state;
+                    renderGame();
+                    break;
+                default:
+                    log(`Événement inconnu: ${data.event}`);
+            }
+        }
+
+        // Fonction pour lancer la partie
+        async function startGame() {
+            const message = {
+                event: "start_game"
+            };
+            socket.send(JSON.stringify(message));
+        }
+
+        async function resetRedis(){
+            try {
+                await fetch("/reset", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    }
+                });
+            } catch (error) {
+                console.error("Erreur lors de la réinitialisation de Redis:", error);
+                log("Erreur lors de la réinitialisation de Redis.");
+            }
+        }
+
+        // Fonction pour envoyer le mouvement du joueur
+        async function sendMove(direction) {
+            if (!gameState) {
+                alert("Le jeu n'a pas encore commencé !");
+                return;
+            }
+
+            try {
+                await fetch(`/move/${room_id}`, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({ direction })
+                });
+            } catch (error) {
+                console.error("Erreur lors de l'envoi du mouvement:", error);
+                log("Erreur lors de l'envoi du mouvement.");
+            }
+        }
+
+        // Fonction pour placer une bombe
+        async function placeBomb() {
+            if (!gameState) {
+                alert("Le jeu n'a pas encore commencé !");
+                return;
+            }
+
+            try {
+                await fetch(`/place_bomb/${room_id}`, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    }
+                });
+            } catch (error) {
+                console.error("Erreur lors de la placement de la bombe:", error);
+                log("Erreur lors de la placement de la bombe.");
+            }
+        }
+
+        // Fonction pour dessiner le jeu sur le canvas
+        function renderGame() {
+            if (!gameState) return;
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            // Exemple de dessin de l'état du jeu
+            gameState.players.forEach(player => {
+                ctx.fillStyle = player.color;
+                ctx.fillRect(player.x * tileSize, player.y * tileSize, tileSize, tileSize);
+            });
+        }
+    </script>
+</body>
+</html>
