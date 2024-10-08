@@ -1,4 +1,5 @@
 # app/models/user_models.py
+from typing import Optional
 
 from pydantic import BaseModel
 
@@ -12,6 +13,7 @@ class CreateRoomResponse(BaseModel):
 
 class ListRoom(BaseModel):
     room_id: str
-    creator: str
+    creator: Optional[str]
     game_started: bool
     players: list[str]
+

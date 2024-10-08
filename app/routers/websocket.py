@@ -6,41 +6,24 @@ from app.services.room_service import RoomService
 from app.services.game_service import GameService
 from app.repositories.redis_repository import RedisRepository
 import asyncio
+import json
+
+from app.utils.manager import ConnectionManager
 
 router = APIRouter()
 
-class ConnectionManager:
-    def __init__(self):
-        # room_id -> List of WebSocket
-        self.active_connections: Dict[str, List[WebSocket]] = {}
-
-    async def connect(self, websocket: WebSocket, room_id: str):
-        await websocket.accept()
-        if room_id not in self.active_connections:
-            self.active_connections[room_id] = []
-        self.active_connections[room_id].append(websocket)
-
-    def disconnect(self, websocket: WebSocket, room_id: str):
-        self.active_connections[room_id].remove(websocket)
-        if not self.active_connections[room_id]:
-            del self.active_connections[room_id]
-
-    async def broadcast(self, room_id: str, message: dict):
-        if room_id in self.active_connections:
-            for connection in self.active_connections[room_id]:
-                await connection.send_json(message)
 
 manager = ConnectionManager()
 
 @router.websocket("/ws/{room_id}/{username}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str,
-                            room_service: RoomService = Depends(lambda: RoomService(RedisRepository())),
-                            game_service: GameService = Depends(lambda: GameService(RedisRepository()))):
-    await manager.connect(websocket, room_id)
+                             room_service: RoomService = Depends(lambda: RoomService(RedisRepository())),
+                             game_service: GameService = Depends(lambda: GameService(RedisRepository(),manager))):
+    await manager.connect(websocket, room_id, username)
     try:
         # Vérifier si la salle existe
         if not await room_service.redis.room_exists(room_id):
-            await websocket.send_json({"error": "Salle inexistante"})
+            await manager.send_personal_message({"error": "Salle inexistante"}, websocket)
             await websocket.close()
             return
 
@@ -53,18 +36,32 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str,
             "players": list(players)
         })
 
+        # Vérifier si le jeu a déjà démarré
+        game_started = await game_service.redis.is_game_started(room_id)
+        if game_started:
+            # Envoyer l'état actuel du jeu au nouveau joueur
+            game_state = await game_service.redis.get_game_state(room_id)
+            await manager.send_personal_message({"event": "game_state", "state": game_state}, websocket)
+
+        # Boucle principale pour recevoir les messages du client
         while True:
-            data = await websocket.receive_json()
-            event = data.get("event")
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            event = message.get("event")
 
             if event == "start_game":
-                creator = await room_service.redis.redis.hget(f"room:{room_id}", "creator")
-                if username != creator:
-                    await websocket.send_json({"error": "Seul le créateur peut lancer la partie"})
+                # Vérifier si le jeu n'a pas déjà démarré
+                if game_started:
+                    await manager.send_personal_message({"error": "Le jeu a déjà démarré"}, websocket)
                     continue
 
+                creator = await room_service.redis.redis.hget(f"room:{room_id}", "creator")
+                # if username != creator.decode():
+                #     await manager.send_personal_message({"error": "Seul le créateur peut lancer la partie"}, websocket)
+                #     continue
+                print(players)
                 if len(players) < 2:
-                    await websocket.send_json({"error": "Nombre de joueurs insuffisant pour démarrer la partie (2 minimum)"})
+                    await manager.send_personal_message({"error": "Nombre de joueurs insuffisant pour démarrer la partie (2 minimum)"}, websocket)
                     continue
 
                 # Lancer le jeu
@@ -75,16 +72,36 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str,
                 # Démarrer la boucle de jeu
                 asyncio.create_task(game_service.game_loop(room_id))
 
+                game_started = True
+
             elif event == "game_action":
-                action = data.get("action")
+                action = message.get("action")
                 try:
-                    updated_state = await game_service.handle_game_action(room_id, username, action)
-                    await manager.broadcast(room_id, {"event": "game_update", "state": updated_state})
+                    await game_service.handle_game_action(room_id, username, action)
+                    # Diffuser l'action à tous les autres joueurs
+                    await manager.broadcast(room_id, {
+                        "event": "game_action",
+                        "username": username,
+                        "action": action
+                    })
                 except ValueError as e:
-                    await websocket.send_json({"error": str(e)})
+                    await manager.send_personal_message({"error": str(e)}, websocket)
+
+            elif event == "request_state":
+                # Permettre au client de demander l'état actuel du jeu
+                game_state = await game_service.redis.get_game_state(room_id)
+                await manager.send_personal_message({"event": "game_state", "state": game_state}, websocket)
+
+            elif event == "chat_message":
+                chat_message = message.get("message")
+                await manager.broadcast(room_id, {
+                    "event": "chat_message",
+                    "username": username,
+                    "message": chat_message
+                })
 
     except WebSocketDisconnect:
-        manager.disconnect(websocket, room_id)
+        manager.disconnect(room_id, username)
         await room_service.redis.remove_player_from_room(room_id, username)
         players = await room_service.redis.get_room_players(room_id)
         await manager.broadcast(room_id, {
@@ -92,3 +109,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str,
             "username": username,
             "players": list(players)
         })
+
+        # Optionnel : Arrêter le jeu si plus assez de joueurs
+        if len(players) < 2:
+            await game_service.redis.set_game_started(room_id)
+            await manager.broadcast(room_id, {"event": "game_stopped"})
+

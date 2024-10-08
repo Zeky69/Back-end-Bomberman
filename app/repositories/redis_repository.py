@@ -33,7 +33,7 @@ class RedisRepository:
         return await self.redis.smembers(f"room:{room_id}:players")
 
     async def set_game_started(self, room_id: str):
-        await self.redis.hset(f"room:{room_id}", "game_started", 1)  # 1 pour True
+        await self.redis.hset(f"room:{room_id}", "game_started", '1')  # 1 pour True
 
     async def is_game_started(self, room_id: str) -> bool:
         return (await self.redis.hget(f"room:{room_id}", "game_started")) == "1"

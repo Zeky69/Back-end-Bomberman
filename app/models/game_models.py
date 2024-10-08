@@ -12,6 +12,10 @@ class Bomb(BaseModel):
     owner: str
     timer: int
 
+class PowerUp(BaseModel):
+    position: List[int]
+    type: str
+
 class GameState(BaseModel):
     players: Dict[str, PlayerState]
     map: Dict
